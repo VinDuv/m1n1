@@ -1,88 +1,117 @@
+#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-import os, tempfile, shutil, subprocess
+
+import os, tempfile, subprocess
 
 __all__ = ["AsmException", "ARMAsm"]
 
 class AsmException(Exception):
     pass
 
-class BaseAsm(object):
-    def __init__(self, source, addr = 0):
-        self.source = source
-        self._tmp = tempfile.mkdtemp() + os.sep
+class ARMAsm:
+    HEADER = b'.text\n.globl _start\n_start:\n'
+    FOOTER = b'\n.pool\n'
+
+    _env = {'PATH': os.environ.get('PATH', '/usr/bin'), 'LANG': 'C'}
+    _arch = os.environ.get('ARCH', 'aarch64-linux-gnu-')
+    _use_llvm = None
+    _llvm_suffix = None
+
+    def __init__(self, source, addr=0):
+        source = self.HEADER + source.encode('ascii') + self.FOOTER
+
         self.addr = addr
-        self.compile(source)
-
-    def compile(self, source):
-        self.sfile = self._tmp + "b.S"
-        with open(self.sfile, "w") as fd:
-            fd.write(self.HEADER + "\n")
-            fd.write(source + "\n")
-            fd.write(self.FOOTER + "\n")
-
-        self.elffile = self._tmp + "b.elf"
-        self.bfile = self._tmp + "b.b"
-        self.nfile = self._tmp + "b.n"
-
-        subprocess.check_call("%sgcc %s -Ttext=0x%x -o %s %s" % (self.PREFIX, self.CFLAGS, self.addr, self.elffile, self.sfile), shell=True)
-        subprocess.check_call("%sobjcopy -j.text -O binary %s %s" % (self.PREFIX, self.elffile, self.bfile), shell=True)
-        subprocess.check_call("%snm %s > %s" % (self.PREFIX, self.elffile, self.nfile), shell=True)
-
-        with open(self.bfile, "rb") as fd:
-            self.data = fd.read()
-
-        with open(self.nfile) as fd:
-            for line in fd:
-                line = line.replace("\n", "")
-                addr, type, name = line.split()
-                addr = int(addr, 16)
-                setattr(self, name, addr)
-        self.start = self._start
+        self._elf_data, self.data = self._compile(source, addr)
         self.len = len(self.data)
-        self.end = self.start + self.len
-
-    def objdump(self):
-        subprocess.check_call("%sobjdump -rd %s" % (self.PREFIX, self.elffile), shell=True)
 
     def disassemble(self):
-        output = subprocess.check_output("%sobjdump -zd %s" % (self.PREFIX, self.elffile), shell=True).decode("ascii")
+        disass_cmd = self._build_command('objdump', '-zd /dev/stdin',
+            llvm_arch_arg='arch')
+        proc = subprocess.run(disass_cmd, input=self._elf_data, env=self._env,
+            check=True, stdout=subprocess.PIPE)
 
-        for line in output.split("\n"):
-            if not line or line[0] != " ":
+        for line in proc.stdout.decode('ascii').split('\n'):
+            if not line or line[0] not in ' ':
                 continue
+
             yield line
 
-    def __del__(self):
-        if self._tmp:
-            shutil.rmtree(self._tmp)
-            self._tmp = None
+    @classmethod
+    def _compile(cls, source, addr):
+        # gcc and objdump requires writable directory
+        with tempfile.TemporaryDirectory('m1n1asm') as dir:
+            elf_file_name = os.path.join(dir, 'b.elf')
 
-class ARMAsm(BaseAsm):
-    PREFIX = os.path.join(os.environ.get("ARCH", "aarch64-linux-gnu-"))
-    CFLAGS = "-pipe -Wall -nostartfiles -nodefaultlibs -march=armv8.2-a"
-    HEADER = """
-    .text
-    .globl _start
-_start:
-    """
-    FOOTER = """
-    .pool
-    """
+            asm_cmd = cls._build_command('gcc', '-pipe -Wall -nostartfiles '
+                '-nodefaultlibs -march=armv8.2-a -x assembler - -o {elf}',
+                elf=elf_file_name, linker_arg=f'-Ttext={addr:#x}')
+
+            copy_cmd = cls._build_command('objcopy', '-j.text -O binary {elf} '
+                '/dev/stdout', elf=elf_file_name, llvm_arch_arg='input-target')
+
+            subprocess.run(asm_cmd, input=source, env=cls._env, check=True)
+            proc = subprocess.run(copy_cmd, env=cls._env, check=True,
+                stdout=subprocess.PIPE)
+
+            with open(elf_file_name, 'rb') as elf_file:
+                elf_data = elf_file.read()
+
+            return elf_data, proc.stdout
+
+    @classmethod
+    def _build_command(cls, tool, cmd_args, llvm_arch_arg='target',
+        linker_arg='', **fmtargs):
+        if cls._use_llvm is None:
+            suffix = os.environ.get('USE_LLVM')
+            if suffix is None:
+                suffix = os.environ.get('USE_CLANG')
+
+            if suffix is None:
+                cls._use_llvm = False
+            else:
+                if len(suffix) < 2:
+                    raise ValueError("USE_LLVM must indicate the full suffix "
+                        "to put on llvm/clang commands (example: USE_LLVM=-11 "
+                        "will use clang-11 and llvm-objcopy-11)")
+                cls._use_llvm = True
+                cls._llvm_suffix = suffix
+
+        if cls._use_llvm:
+            if tool == 'gcc':
+                tool = 'clang'
+            else:
+                tool = f'llvm-{tool}'
+
+            cmdline = [f'{tool}{cls._llvm_suffix}',
+                f'--{llvm_arch_arg}={cls._arch}']
+
+            if linker_arg:
+                cmdline.extend(('-fuse-ld=lld', f'-Wl,{linker_arg}'))
+
+        else:
+            cmdline = [f'{cls._arch}{tool}']
+
+            if linker_arg:
+                cmdline.append(linker_arg)
+
+        cmdline.extend(cmd_args.format(**fmtargs).split())
+
+        return cmdline
+
 
 if __name__ == "__main__":
-    import sys
+    import struct
     code = """
     ldr x0, =0xDEADBEEF
-    b test
-    mrs x0, spsel
-    svc 1
-    %s
-test:
-    b test
     ret
-""" % (" ".join(sys.argv[1:]))
+    """
     c = ARMAsm(code, 0x1238)
-    c.objdump()
-    assert c.start == 0x1238
-    assert c.test == 0x1240
+    print("\n".join(c.disassemble()))
+    assert c.addr == 0x1238
+    assert struct.unpack('4I', c.data) == (
+        0x58000040,  # ldr x0, +0x8
+        0x0d65f03c0, # ret
+        0xdeadbeef,
+        0x00000000,
+    )
 
