@@ -8,7 +8,7 @@
 #include "xnuboot.h"
 
 #define DISPLAY_STATUS_DELAY   100
-#define DISPLAY_STATUS_RETRIES 20
+#define DISPLAY_STATUS_RETRIES 50
 
 #define COMPARE(a, b)                                                                              \
     if ((a) > (b)) {                                                                               \
@@ -52,6 +52,46 @@ void display_choose_color_mode(dcp_color_mode_t *modes, int cnt, dcp_color_mode_
            best->colorimetry, best->eotf, best->encoding, best->bpp);
 }
 
+int display_wait_connected(dcp_iboot_if_t *iboot, int *timing_cnt, int *color_cnt)
+{
+    int hpd;
+
+    for (int retries = 0; retries < DISPLAY_STATUS_RETRIES; retries += 1) {
+        hpd = dcp_ib_get_hpd(iboot, timing_cnt, color_cnt);
+        if ((hpd > 0) && *timing_cnt && *color_cnt) {
+            printf("display: waited %d ms for display connected\n", retries * DISPLAY_STATUS_DELAY);
+            return 1;
+        }
+
+        mdelay(DISPLAY_STATUS_DELAY);
+    }
+
+    // hpd is 0 if no display, negative if an error occurred
+    return hpd;
+}
+
+int display_wait_disconnected(dcp_iboot_if_t *iboot)
+{
+    int hpd, timing_cnt, color_cnt;
+
+    for (int retries = 0; retries < DISPLAY_STATUS_RETRIES; retries += 1) {
+        hpd = dcp_ib_get_hpd(iboot, &timing_cnt, &color_cnt);
+        if (hpd < 0) {
+            return hpd;
+        }
+
+        if (!hpd) {
+            printf("display: waited %d ms for display disconnected\n",
+                   retries * DISPLAY_STATUS_DELAY);
+            return 1;
+        }
+
+        mdelay(DISPLAY_STATUS_DELAY);
+    }
+
+    return 0;
+}
+
 int display_configure(void)
 {
     int ret = -1;
@@ -83,29 +123,18 @@ int display_configure(void)
 
     // Detect if display is connected
     int timing_cnt, color_cnt;
-    int hpd = 0, retries = 0;
 
     /* After boot DCP does not immediately report a connected display. Retry getting display
      * information for 2 seconds.
      */
-    while (retries++ < DISPLAY_STATUS_RETRIES) {
-        hpd = dcp_ib_get_hpd(iboot, &timing_cnt, &color_cnt);
-        if (hpd < 0)
-            ret = hpd;
-        else if (hpd && timing_cnt && color_cnt)
-            break;
-        if (retries < DISPLAY_STATUS_RETRIES)
-            mdelay(DISPLAY_STATUS_DELAY);
-    }
-    printf("display: waited %d ms for display status\n", (retries - 1) * DISPLAY_STATUS_DELAY);
-    if (ret < 0) {
-        printf("display: failed to get display status\n");
+    if ((ret = display_wait_connected(iboot, &timing_cnt, &color_cnt)) < 0) {
+        printf("display: failed to get display status (%d)\n", ret);
         goto err_iboot;
     }
 
-    printf("display: connected:%d timing_cnt:%d color_cnt:%d\n", hpd, timing_cnt, color_cnt);
+    printf("display: connected:%d timing_cnt:%d color_cnt:%d\n", ret, timing_cnt, color_cnt);
 
-    if (!hpd || !timing_cnt || !color_cnt)
+    if (!ret || !timing_cnt || !color_cnt)
         goto bail;
 
     // Find best modes
@@ -135,6 +164,33 @@ int display_configure(void)
     int swap_id = ret = dcp_ib_swap_begin(iboot);
     if (swap_id < 0) {
         printf("display: failed to start swap\n");
+        goto err_iboot;
+    }
+
+    // Some monitors disconnect when getting out of sleep mode. Wait a bit to see if
+    // that happens.
+    if ((ret = display_wait_disconnected(iboot)) < 0) {
+        printf("display: failed to wait for disconnect\n");
+        goto err_iboot;
+    }
+
+    if (ret) {
+        printf("display: disconnected, waiting for reconnection.\n");
+        ret = display_wait_connected(iboot, &timing_cnt, &color_cnt);
+        if (ret < 0) {
+            printf("display: failed to wait for reconnection\n");
+            goto err_iboot;
+        } else if (ret == 0) {
+            printf("display: not reconnected in time\n");
+            ret = -1;
+            goto err_iboot;
+        }
+    } else {
+        printf("display: did not disconnect\n");
+    }
+
+    if ((ret = dcp_ib_set_mode(iboot, &tbest, &cbest)) < 0) {
+        printf("display: failed to set mode\n");
         goto err_iboot;
     }
 
